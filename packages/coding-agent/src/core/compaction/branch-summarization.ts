@@ -8,14 +8,8 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { Model } from "@mariozechner/pi-ai";
 import { completeSimple } from "@mariozechner/pi-ai";
-import {
-	convertToLlm,
-	createBranchSummaryMessage,
-	createCompactionSummaryMessage,
-	createContextRewriteMessage,
-	createCustomMessage,
-} from "../messages.js";
-import type { ReadonlySessionManager, SessionEntry } from "../session-manager.js";
+import { convertToLlm } from "../messages.js";
+import { buildSessionProjection, type ReadonlySessionManager, type SessionEntry } from "../session-manager.js";
 import { estimateTokens } from "./compaction.js";
 import {
 	computeFileLists,
@@ -137,42 +131,8 @@ export function collectEntriesForBranchSummary(
 }
 
 // ============================================================================
-// Entry to Message Conversion
+// Summarization Preparation
 // ============================================================================
-
-/**
- * Extract AgentMessage from a session entry.
- * Similar to getMessageFromEntry in compaction.ts but also handles compaction entries.
- */
-function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
-	switch (entry.type) {
-		case "message":
-			// Skip tool results - context is in assistant's tool call
-			if (entry.message.role === "toolResult") return undefined;
-			return entry.message;
-
-		case "custom_message":
-			return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
-
-		case "branch_summary":
-			return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
-
-		case "compaction":
-			return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
-
-		case "context_rewrite":
-			return createContextRewriteMessage(entry.after, entry.rewriteId ?? entry.id, entry.timestamp);
-
-		// These don't contribute to conversation content
-		case "thinking_level_change":
-		case "model_change":
-		case "context_rewrite_undo":
-		case "custom":
-		case "label":
-		case "session_info":
-			return undefined;
-	}
-}
 
 /**
  * Prepare entries for summarization with token budget.
@@ -215,11 +175,11 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		}
 	}
 
-	// Second pass: walk from newest to oldest, adding messages until token budget
-	for (let i = entries.length - 1; i >= 0; i--) {
-		const entry = entries[i];
-		const message = getMessageFromEntry(entry);
-		if (!message) continue;
+	const projectedItems = buildSessionProjection(entries).items.filter((item) => item.message.role !== "toolResult");
+
+	// Second pass: walk from newest to oldest, adding projected messages until token budget
+	for (let i = projectedItems.length - 1; i >= 0; i--) {
+		const message = projectedItems[i].message;
 
 		// Extract file ops from assistant messages (tool calls)
 		extractFileOpsFromMessage(message, fileOps);
@@ -228,12 +188,15 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 
 		// Check budget before adding
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
-			// If this is a summary entry, try to fit it anyway as it's important context
-			if (entry.type === "compaction" || entry.type === "branch_summary" || entry.type === "context_rewrite") {
-				if (totalTokens < tokenBudget * 0.9) {
-					messages.unshift(message);
-					totalTokens += tokens;
-				}
+			// If this is a summary/rewrite entry, try to fit it anyway as it's important context
+			if (
+				(message.role === "compactionSummary" ||
+					message.role === "branchSummary" ||
+					message.role === "contextRewrite") &&
+				totalTokens < tokenBudget * 0.9
+			) {
+				messages.unshift(message);
+				totalTokens += tokens;
 			}
 			// Stop - we've hit the budget
 			break;

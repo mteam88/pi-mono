@@ -118,7 +118,7 @@ describe("AgentSession.getSessionStats", () => {
 		}
 	});
 
-	it("estimates projected context usage when context rewrites are active", () => {
+	it("estimates projected context usage until a response observes the latest context rewrite", () => {
 		const { session, sessionManager } = createSession();
 
 		try {
@@ -133,17 +133,21 @@ describe("AgentSession.getSessionStats", () => {
 				truncated: false,
 				timestamp: 2,
 			});
+			sessionManager.appendMessage(createAssistantMessage("pre-rewrite usage", 50_000, 3));
 			sessionManager.appendContextRewrite({
 				target: { kind: "surface", entryId: bashId, surface: "output" },
 				beforeHash: hashContextText(output),
 				after: "[output omitted]",
 			});
-			sessionManager.appendMessage(createAssistantMessage("done", 50_000, 3));
 			syncAgentMessages(session, sessionManager);
 
-			const usage = session.getContextUsage();
-			expect(usage?.tokens).toBeLessThan(100);
-			expect(usage?.tokens).not.toBe(50_000);
+			const immediateUsage = session.getContextUsage();
+			expect(immediateUsage?.tokens).toBeLessThan(100);
+			expect(immediateUsage?.tokens).not.toBe(50_000);
+
+			sessionManager.appendMessage(createAssistantMessage("post-rewrite usage", 75, Date.now() + 1));
+			syncAgentMessages(session, sessionManager);
+			expect(session.getContextUsage()?.tokens).toBe(75);
 		} finally {
 			session.dispose();
 		}

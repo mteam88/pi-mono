@@ -271,10 +271,12 @@ function createExtensionAPI(
 		},
 
 		appendContextRewrite<T = unknown>(rewrite: ContextRewriteInput<T>) {
+			runtime.assertActive();
 			return runtime.appendContextRewrite(rewrite);
 		},
 
 		undoContextRewrite(rewriteId: string) {
+			runtime.assertActive();
 			return runtime.undoContextRewrite(rewriteId);
 		},
 

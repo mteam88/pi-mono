@@ -3090,6 +3090,9 @@ export class InteractiveMode {
 				break;
 			}
 			case "contextRewrite": {
+				if (this.chatContainer.children.length > 0) {
+					this.chatContainer.addChild(new Spacer(1));
+				}
 				const userComponent = new UserMessageComponent(message.text, this.getMarkdownThemeWithSettings());
 				this.chatContainer.addChild(userComponent);
 				break;

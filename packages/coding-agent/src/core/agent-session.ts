@@ -3003,8 +3003,34 @@ export class AgentSession {
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return undefined;
 
-		const projection = this.sessionManager.buildSessionProjection();
-		if (projection.activeRewrites.length > 0) {
+		const branchEntries = this.sessionManager.getBranch();
+		let latestContextRewriteChangeTime: number | undefined;
+		for (let i = branchEntries.length - 1; i >= 0; i--) {
+			const entry = branchEntries[i];
+			if (entry.type === "context_rewrite" || entry.type === "context_rewrite_undo") {
+				latestContextRewriteChangeTime = new Date(entry.timestamp).getTime();
+				break;
+			}
+		}
+
+		let latestUsageTime: number | undefined;
+		for (let i = branchEntries.length - 1; i >= 0; i--) {
+			const entry = branchEntries[i];
+			if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+			const assistant = entry.message;
+			if (assistant.stopReason === "aborted" || assistant.stopReason === "error") continue;
+			const contextTokens = calculateContextTokens(assistant.usage);
+			if (contextTokens > 0) {
+				latestUsageTime = assistant.timestamp;
+			}
+			break;
+		}
+
+		if (
+			latestContextRewriteChangeTime !== undefined &&
+			(latestUsageTime === undefined || latestContextRewriteChangeTime > latestUsageTime)
+		) {
+			const projection = this.sessionManager.buildSessionProjection();
 			const tokens = projection.messages.reduce((total, message) => total + estimateTokens(message), 0);
 			return {
 				tokens,
@@ -3016,7 +3042,6 @@ export class AgentSession {
 		// After compaction, the last assistant usage reflects pre-compaction context size.
 		// We can only trust usage from an assistant that responded after the latest compaction.
 		// If no such assistant exists, context token count is unknown until the next LLM response.
-		const branchEntries = this.sessionManager.getBranch();
 		const latestCompaction = getLatestCompactionEntry(branchEntries);
 
 		if (latestCompaction) {

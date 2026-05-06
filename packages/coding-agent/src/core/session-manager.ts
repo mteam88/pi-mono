@@ -127,10 +127,11 @@ export interface ContextRewriteInput<T = unknown> {
 
 export interface SessionProjectionItem {
 	message: AgentMessage;
-	/** Session entries whose projected context is represented by this item. */
+	/** Original session entries represented by this projected item. */
 	sourceEntryIds: string[];
-	/** Entry that produced the projected item. For rewrites, this is the rewrite entry id. */
+	/** Entry id to show for this projected item. Whole-item replacements and insertions use the rewrite entry id. */
 	entryId: string;
+	/** Stable rewrite id when this item was produced or modified by a context rewrite. */
 	rewriteId?: string;
 }
 

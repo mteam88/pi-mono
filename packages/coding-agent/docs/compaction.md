@@ -6,7 +6,7 @@ LLMs have limited context windows. When conversations grow too long, pi uses com
 - [`packages/coding-agent/src/core/compaction/compaction.ts`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/compaction/compaction.ts) - Auto-compaction logic
 - [`packages/coding-agent/src/core/compaction/branch-summarization.ts`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) - Branch summarization
 - [`packages/coding-agent/src/core/compaction/utils.ts`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/compaction/utils.ts) - Shared utilities (file tracking, serialization)
-- [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `BranchSummaryEntry`)
+- [`packages/coding-agent/src/core/session-manager.ts`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts) - Entry types (`CompactionEntry`, `ContextRewriteEntry`, legacy `BranchSummaryEntry`)
 - [`packages/coding-agent/src/core/extensions/types.ts`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/extensions/types.ts) - Extension event types
 
 For TypeScript definitions in your project, inspect `node_modules/@mariozechner/pi-coding-agent/dist/`.
@@ -112,7 +112,7 @@ Valid cut points are:
 - User messages
 - Assistant messages
 - BashExecution messages
-- Custom messages (custom_message, branch_summary)
+- Custom/projection messages (`custom_message`, legacy `branch_summary`, `context_rewrite`)
 
 Never cut at tool results (they must stay with their tool call).
 
@@ -156,7 +156,7 @@ When you use `/tree` to navigate to a different branch, pi offers to summarize t
 2. **Collect entries**: Walk from old leaf back to common ancestor
 3. **Prepare with budget**: Include messages up to token budget (newest first)
 4. **Generate summary**: Call LLM with structured format
-5. **Append entry**: Save `BranchSummaryEntry` at navigation point
+5. **Append entry**: Save a `ContextRewriteEntry` insertion at the navigation point
 
 ```
 Tree before navigation:
@@ -183,18 +183,18 @@ Both compaction and branch summarization track files cumulatively. When generati
 
 This means file tracking accumulates across multiple compactions or nested branch summaries, preserving the full history of read and modified files.
 
-### BranchSummaryEntry Structure
+### ContextRewriteEntry Structure
 
 Defined in [`session-manager.ts`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/session-manager.ts):
 
 ```typescript
-interface BranchSummaryEntry<T = unknown> {
-  type: "branch_summary";
+interface ContextRewriteEntry<T = unknown> {
+  type: "context_rewrite";
   id: string;
-  parentId: string;
-  timestamp: number;
-  summary: string;
-  fromId: string;      // Entry we navigated from
+  parentId: string | null;
+  timestamp: string;
+  target: { kind: "insert"; afterEntryId: string | null };
+  after: string;       // generated summary text
   fromHook?: boolean;  // true if provided by extension (legacy field name)
   details?: T;         // implementation-specific data
 }
@@ -206,7 +206,7 @@ interface BranchSummaryDetails {
 }
 ```
 
-Same as compaction, extensions can store custom data in `details`.
+Older sessions may contain `BranchSummaryEntry` (`type: "branch_summary"`). They still project into context, but new branch summaries are stored as context rewrite insertions. Same as compaction, extensions can store custom data in `details`.
 
 See [`collectEntriesForBranchSummary()`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts), [`prepareBranchEntries()`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts), and [`generateBranchSummary()`](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/src/core/compaction/branch-summarization.ts) for the implementation.
 

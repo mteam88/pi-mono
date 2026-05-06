@@ -66,6 +66,13 @@ export interface CompactionSummaryMessage {
 	timestamp: number;
 }
 
+export interface ContextRewriteMessage {
+	role: "contextRewrite";
+	text: string;
+	rewriteId: string;
+	timestamp: number;
+}
+
 // Extend CustomAgentMessages via declaration merging
 declare module "@mariozechner/pi-agent-core" {
 	interface CustomAgentMessages {
@@ -73,6 +80,7 @@ declare module "@mariozechner/pi-agent-core" {
 		custom: CustomMessage;
 		branchSummary: BranchSummaryMessage;
 		compactionSummary: CompactionSummaryMessage;
+		contextRewrite: ContextRewriteMessage;
 	}
 }
 
@@ -115,6 +123,15 @@ export function createCompactionSummaryMessage(
 		role: "compactionSummary",
 		summary: summary,
 		tokensBefore,
+		timestamp: new Date(timestamp).getTime(),
+	};
+}
+
+export function createContextRewriteMessage(text: string, rewriteId: string, timestamp: string): ContextRewriteMessage {
+	return {
+		role: "contextRewrite",
+		text,
+		rewriteId,
 		timestamp: new Date(timestamp).getTime(),
 	};
 }
@@ -179,6 +196,12 @@ export function convertToLlm(messages: AgentMessage[]): Message[] {
 						content: [
 							{ type: "text" as const, text: COMPACTION_SUMMARY_PREFIX + m.summary + COMPACTION_SUMMARY_SUFFIX },
 						],
+						timestamp: m.timestamp,
+					};
+				case "contextRewrite":
+					return {
+						role: "user",
+						content: [{ type: "text" as const, text: m.text }],
 						timestamp: m.timestamp,
 					};
 				case "user":

@@ -1333,6 +1333,30 @@ pi.on("session_start", async (_event, ctx) => {
 });
 ```
 
+### pi.appendContextRewrite(rewrite)
+
+Append a branch-local context rewrite. Rewrites affect `buildSessionContext()` and therefore provider requests, compaction, context usage, and session reloads without mutating earlier entries.
+
+```typescript
+pi.appendContextRewrite({
+  rewriteId: "omit-large-output",
+  target: { kind: "surface", entryId: "entry-id", surface: "output" },
+  beforeHash: "sha256:...", // optional drift guard
+  after: "[large output omitted]",
+  reason: "not relevant for future turns",
+});
+```
+
+Use `range` targets to replace a projected span with a summary, `surface` targets to edit one text surface, and `insert` targets to inject summary text at a point in the branch. Use `hashContextText()` from `@mariozechner/pi-coding-agent` to compute `beforeHash` guards.
+
+### pi.undoContextRewrite(rewriteId)
+
+Undo an active rewrite on the current branch by appending a `context_rewrite_undo` entry.
+
+```typescript
+pi.undoContextRewrite("omit-large-output");
+```
+
 ### pi.setSessionName(name)
 
 Set the session display name (shown in session selector instead of first message).

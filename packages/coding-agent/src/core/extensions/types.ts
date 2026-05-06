@@ -52,6 +52,8 @@ import type { ModelRegistry } from "../model-registry.js";
 import type {
 	BranchSummaryEntry,
 	CompactionEntry,
+	ContextRewriteEntry,
+	ContextRewriteInput,
 	ReadonlySessionManager,
 	SessionEntry,
 	SessionManager,
@@ -583,7 +585,7 @@ export interface SessionTreeEvent {
 	type: "session_tree";
 	newLeafId: string | null;
 	oldLeafId: string | null;
-	summaryEntry?: BranchSummaryEntry;
+	summaryEntry?: BranchSummaryEntry | ContextRewriteEntry;
 	fromExtension?: boolean;
 }
 
@@ -1192,6 +1194,12 @@ export interface ExtensionAPI {
 	/** Append a custom entry to the session for state persistence (not sent to LLM). */
 	appendEntry<T = unknown>(customType: string, data?: T): void;
 
+	/** Append a branch-local context rewrite. Returns the session entry id. */
+	appendContextRewrite<T = unknown>(rewrite: ContextRewriteInput<T>): string;
+
+	/** Undo an active context rewrite by rewriteId. Returns the undo entry id. */
+	undoContextRewrite(rewriteId: string): string;
+
 	// =========================================================================
 	// Session Metadata
 	// =========================================================================
@@ -1416,6 +1424,10 @@ export type SendUserMessageHandler = (
 
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
+export type AppendContextRewriteHandler = <T = unknown>(rewrite: ContextRewriteInput<T>) => string;
+
+export type UndoContextRewriteHandler = (rewriteId: string) => string;
+
 export type SetSessionNameHandler = (name: string) => void;
 
 export type GetSessionNameHandler = () => string | undefined;
@@ -1473,6 +1485,8 @@ export interface ExtensionActions {
 	sendMessage: SendMessageHandler;
 	sendUserMessage: SendUserMessageHandler;
 	appendEntry: AppendEntryHandler;
+	appendContextRewrite?: AppendContextRewriteHandler;
+	undoContextRewrite?: UndoContextRewriteHandler;
 	setSessionName: SetSessionNameHandler;
 	getSessionName: GetSessionNameHandler;
 	setLabel: SetLabelHandler;
@@ -1532,7 +1546,10 @@ export interface ExtensionCommandContextActions {
  * Full runtime = state + actions.
  * Created by loader with throwing action stubs, completed by runner.initialize().
  */
-export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {}
+export interface ExtensionRuntime extends ExtensionRuntimeState, ExtensionActions {
+	appendContextRewrite: AppendContextRewriteHandler;
+	undoContextRewrite: UndoContextRewriteHandler;
+}
 
 /** Loaded extension with all registered items. */
 export interface Extension {

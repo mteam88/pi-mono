@@ -191,12 +191,19 @@ export {
 export {
 	type BranchSummaryEntry,
 	buildSessionContext,
+	buildSessionProjection,
 	type CompactionEntry,
+	type ContextRewriteEntry,
+	type ContextRewriteInput,
+	type ContextRewriteSurface,
+	type ContextRewriteTarget,
+	type ContextRewriteUndoEntry,
 	CURRENT_SESSION_VERSION,
 	type CustomEntry,
 	type CustomMessageEntry,
 	type FileEntry,
 	getLatestCompactionEntry,
+	hashContextText,
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	type NewSessionOptions,
@@ -209,6 +216,8 @@ export {
 	type SessionInfoEntry,
 	SessionManager,
 	type SessionMessageEntry,
+	type SessionProjection,
+	type SessionProjectionItem,
 	type ThinkingLevelChangeEntry,
 } from "./core/session-manager.js";
 export {

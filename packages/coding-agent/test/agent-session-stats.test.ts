@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
-import { SessionManager } from "../src/core/session-manager.js";
+import { hashContextText, SessionManager } from "../src/core/session-manager.js";
 import { SettingsManager } from "../src/core/settings-manager.js";
 import { createTestResourceLoader } from "./utilities.js";
 
@@ -113,6 +113,37 @@ describe("AgentSession.getSessionStats", () => {
 			expect(stats.contextUsage).toBeDefined();
 			expect(stats.contextUsage?.tokens).toBeNull();
 			expect(stats.contextUsage?.percent).toBeNull();
+		} finally {
+			session.dispose();
+		}
+	});
+
+	it("estimates projected context usage when context rewrites are active", () => {
+		const { session, sessionManager } = createSession();
+
+		try {
+			sessionManager.appendMessage(createUserMessage("run command", 1));
+			const output = "large output ".repeat(1000);
+			const bashId = sessionManager.appendMessage({
+				role: "bashExecution",
+				command: "generate large output",
+				output,
+				exitCode: 0,
+				cancelled: false,
+				truncated: false,
+				timestamp: 2,
+			});
+			sessionManager.appendContextRewrite({
+				target: { kind: "surface", entryId: bashId, surface: "output" },
+				beforeHash: hashContextText(output),
+				after: "[output omitted]",
+			});
+			sessionManager.appendMessage(createAssistantMessage("done", 50_000, 3));
+			syncAgentMessages(session, sessionManager);
+
+			const usage = session.getContextUsage();
+			expect(usage?.tokens).toBeLessThan(100);
+			expect(usage?.tokens).not.toBe(50_000);
 		} finally {
 			session.dispose();
 		}

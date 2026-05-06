@@ -11,10 +11,15 @@ import { completeSimple } from "@mariozechner/pi-ai";
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
-	createCompactionSummaryMessage,
+	createContextRewriteMessage,
 	createCustomMessage,
 } from "../messages.js";
-import { buildSessionContext, type CompactionEntry, type SessionEntry } from "../session-manager.js";
+import {
+	buildSessionContext,
+	buildSessionProjection,
+	type CompactionEntry,
+	type SessionEntry,
+} from "../session-manager.js";
 import {
 	computeFileLists,
 	createFileOps,
@@ -71,33 +76,6 @@ function extractFileOperations(
 // ============================================================================
 // Message Extraction
 // ============================================================================
-
-/**
- * Extract AgentMessage from an entry if it produces one.
- * Returns undefined for entries that don't contribute to LLM context.
- */
-function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
-	if (entry.type === "message") {
-		return entry.message;
-	}
-	if (entry.type === "custom_message") {
-		return createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp);
-	}
-	if (entry.type === "branch_summary") {
-		return createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp);
-	}
-	if (entry.type === "compaction") {
-		return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
-	}
-	return undefined;
-}
-
-function getMessageFromEntryForCompaction(entry: SessionEntry): AgentMessage | undefined {
-	if (entry.type === "compaction") {
-		return undefined;
-	}
-	return getMessageFromEntry(entry);
-}
 
 /** Result from compact() - SessionManager adds uuid/parentUuid when saving */
 export interface CompactionResult<T = unknown> {
@@ -284,6 +262,10 @@ export function estimateTokens(message: AgentMessage): number {
 			chars = message.summary.length;
 			return Math.ceil(chars / 4);
 		}
+		case "contextRewrite": {
+			chars = message.text.length;
+			return Math.ceil(chars / 4);
+		}
 	}
 
 	return 0;
@@ -323,13 +305,15 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 			case "branch_summary":
 			case "custom":
 			case "custom_message":
+			case "context_rewrite":
+			case "context_rewrite_undo":
 			case "label":
 			case "session_info":
 				break;
 		}
 
-		// branch_summary and custom_message are user-role messages, valid cut points
-		if (entry.type === "branch_summary" || entry.type === "custom_message") {
+		// branch_summary, custom_message, and context_rewrite are user-role messages, valid cut points
+		if (entry.type === "branch_summary" || entry.type === "custom_message" || entry.type === "context_rewrite") {
 			cutPoints.push(i);
 		}
 	}
@@ -344,8 +328,8 @@ function findValidCutPoints(entries: SessionEntry[], startIndex: number, endInde
 export function findTurnStartIndex(entries: SessionEntry[], entryIndex: number, startIndex: number): number {
 	for (let i = entryIndex; i >= startIndex; i--) {
 		const entry = entries[i];
-		// branch_summary and custom_message are user-role messages, can start a turn
-		if (entry.type === "branch_summary" || entry.type === "custom_message") {
+		// branch_summary, custom_message, and context_rewrite are user-role messages, can start a turn
+		if (entry.type === "branch_summary" || entry.type === "custom_message" || entry.type === "context_rewrite") {
 			return i;
 		}
 		if (entry.type === "message") {
@@ -356,6 +340,29 @@ export function findTurnStartIndex(entries: SessionEntry[], entryIndex: number, 
 		}
 	}
 	return -1;
+}
+
+function estimateEntryTokensForCut(entry: SessionEntry): number {
+	switch (entry.type) {
+		case "message":
+			return estimateTokens(entry.message);
+		case "custom_message":
+			return estimateTokens(
+				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+			);
+		case "branch_summary":
+			return estimateTokens(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
+		case "context_rewrite":
+			return estimateTokens(createContextRewriteMessage(entry.after, entry.rewriteId ?? entry.id, entry.timestamp));
+		case "compaction":
+		case "thinking_level_change":
+		case "model_change":
+		case "context_rewrite_undo":
+		case "custom":
+		case "label":
+		case "session_info":
+			return 0;
+	}
 }
 
 export interface CutPointResult {
@@ -401,10 +408,9 @@ export function findCutPoint(
 
 	for (let i = endIndex - 1; i >= startIndex; i--) {
 		const entry = entries[i];
-		if (entry.type !== "message") continue;
+		const messageTokens = estimateEntryTokensForCut(entry);
+		if (messageTokens === 0) continue;
 
-		// Estimate this message's size
-		const messageTokens = estimateTokens(entry.message);
 		accumulatedTokens += messageTokens;
 
 		// Check if we've exceeded the budget
@@ -650,21 +656,22 @@ export function prepareCompaction(
 
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 
+	const effectiveItems = buildSessionProjection(pathEntries).items;
+	const collectEffectiveMessages = (start: number, end: number): AgentMessage[] => {
+		const ids = new Set(pathEntries.slice(start, end).map((entry) => entry.id));
+		return effectiveItems
+			.filter((item) => item.sourceEntryIds.some((id) => ids.has(id)))
+			.map((item) => item.message)
+			.filter((message) => message.role !== "compactionSummary");
+	};
+
 	// Messages to summarize (will be discarded after summary)
-	const messagesToSummarize: AgentMessage[] = [];
-	for (let i = boundaryStart; i < historyEnd; i++) {
-		const msg = getMessageFromEntryForCompaction(pathEntries[i]);
-		if (msg) messagesToSummarize.push(msg);
-	}
+	const messagesToSummarize = collectEffectiveMessages(boundaryStart, historyEnd);
 
 	// Messages for turn prefix summary (if splitting a turn)
-	const turnPrefixMessages: AgentMessage[] = [];
-	if (cutPoint.isSplitTurn) {
-		for (let i = cutPoint.turnStartIndex; i < cutPoint.firstKeptEntryIndex; i++) {
-			const msg = getMessageFromEntryForCompaction(pathEntries[i]);
-			if (msg) turnPrefixMessages.push(msg);
-		}
-	}
+	const turnPrefixMessages = cutPoint.isSplitTurn
+		? collectEffectiveMessages(cutPoint.turnStartIndex, cutPoint.firstKeptEntryIndex)
+		: [];
 
 	// Extract file operations from messages and previous compaction
 	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);

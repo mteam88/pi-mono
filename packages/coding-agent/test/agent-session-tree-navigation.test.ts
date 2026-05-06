@@ -10,7 +10,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import type { BranchSummaryEntry, ContextRewriteEntry } from "../src/core/session-manager.js";
 import { API_KEY, createTestSession, type TestSessionContext } from "./utilities.js";
+
+function summaryText(entry: BranchSummaryEntry | ContextRewriteEntry | undefined): string | undefined {
+	if (!entry) return undefined;
+	return entry.type === "branch_summary" ? entry.summary : entry.after;
+}
 
 describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 	let ctx: TestSessionContext;
@@ -94,9 +100,9 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 		expect(result.cancelled).toBe(false);
 		expect(result.editorText).toBe("What is 2+2?");
 		expect(result.summaryEntry).toBeDefined();
-		expect(result.summaryEntry?.type).toBe("branch_summary");
-		expect(result.summaryEntry?.summary).toBeTruthy();
-		expect(result.summaryEntry?.summary.length).toBeGreaterThan(0);
+		expect(result.summaryEntry?.type).toBe("context_rewrite");
+		expect(summaryText(result.summaryEntry)).toBeTruthy();
+		expect(summaryText(result.summaryEntry)?.length).toBeGreaterThan(0);
 
 		// Summary should be a root entry (parentId = null) since we navigated to root user
 		expect(result.summaryEntry?.parentId).toBeNull();
@@ -140,7 +146,7 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 		expect(children.length).toBe(2);
 
 		const childTypes = children.map((c) => c.type).sort();
-		expect(childTypes).toContain("branch_summary");
+		expect(childTypes).toContain("context_rewrite");
 		expect(childTypes).toContain("message");
 	}, 120000);
 
@@ -230,8 +236,10 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 		const entriesAfter = sessionManager.getEntries().length;
 		expect(entriesAfter).toBe(entriesBefore);
 
-		// No branch_summary entries
-		const summaries = sessionManager.getEntries().filter((e) => e.type === "branch_summary");
+		// No summary entries
+		const summaries = sessionManager
+			.getEntries()
+			.filter((entry) => entry.type === "branch_summary" || entry.type === "context_rewrite");
 		expect(summaries.length).toBe(0);
 	}, 60000);
 
@@ -270,9 +278,9 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation e2e", () => {
 		});
 
 		expect(result.summaryEntry).toBeDefined();
-		expect(result.summaryEntry?.summary).toBeTruthy();
+		expect(summaryText(result.summaryEntry)).toBeTruthy();
 		// Verify custom instructions were followed
-		expect(result.summaryEntry?.summary).toContain("MONKEY MONKEY MONKEY");
+		expect(summaryText(result.summaryEntry)).toContain("MONKEY MONKEY MONKEY");
 	}, 120000);
 });
 
@@ -318,6 +326,6 @@ describe.skipIf(!API_KEY)("AgentSession tree navigation - branch scenarios", () 
 		expect(result.summaryEntry).toBeDefined();
 
 		// Summary captures the branch we're leaving (the "Branch path" conversation)
-		expect(result.summaryEntry?.summary.length).toBeGreaterThan(0);
+		expect(summaryText(result.summaryEntry)?.length).toBeGreaterThan(0);
 	}, 180000);
 });

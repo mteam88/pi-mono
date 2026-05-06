@@ -28,6 +28,7 @@ import * as _bundledPiCodingAgent from "../../index.js";
 import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
+import type { ContextRewriteInput } from "../session-manager.js";
 import { createSyntheticSourceInfo } from "../source-info.js";
 import type {
 	Extension,
@@ -146,6 +147,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
 		appendEntry: notInitialized,
+		appendContextRewrite: notInitialized,
+		undoContextRewrite: notInitialized,
 		setSessionName: notInitialized,
 		getSessionName: notInitialized,
 		setLabel: notInitialized,
@@ -265,6 +268,14 @@ function createExtensionAPI(
 		appendEntry(customType: string, data?: unknown): void {
 			runtime.assertActive();
 			runtime.appendEntry(customType, data);
+		},
+
+		appendContextRewrite<T = unknown>(rewrite: ContextRewriteInput<T>) {
+			return runtime.appendContextRewrite(rewrite);
+		},
+
+		undoContextRewrite(rewriteId: string) {
+			return runtime.undoContextRewrite(rewriteId);
 		},
 
 		setSessionName(name: string): void {

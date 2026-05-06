@@ -303,6 +303,7 @@ class TreeList implements Component {
 				entry.type === "custom" ||
 				entry.type === "model_change" ||
 				entry.type === "thinking_level_change" ||
+				entry.type === "context_rewrite_undo" ||
 				entry.type === "session_info";
 
 			switch (this.filterMode) {
@@ -536,6 +537,12 @@ class TreeList implements Component {
 			case "branch_summary":
 				parts.push("branch summary", entry.summary);
 				break;
+			case "context_rewrite":
+				parts.push("context rewrite", entry.after, entry.reason ?? "");
+				break;
+			case "context_rewrite_undo":
+				parts.push("context rewrite undo", entry.rewriteId);
+				break;
 			case "session_info":
 				parts.push("title");
 				if (entry.name) parts.push(entry.name);
@@ -759,6 +766,12 @@ class TreeList implements Component {
 			}
 			case "branch_summary":
 				result = theme.fg("warning", `[branch summary]: `) + normalize(entry.summary);
+				break;
+			case "context_rewrite":
+				result = theme.fg("warning", `[context rewrite]: `) + normalize(entry.after);
+				break;
+			case "context_rewrite_undo":
+				result = theme.fg("dim", `[context rewrite undo: ${entry.rewriteId}]`);
 				break;
 			case "model_change":
 				result = theme.fg("dim", `[model: ${entry.modelId}]`);

@@ -1,6 +1,6 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ImageContent, Message, TextContent } from "@mariozechner/pi-ai";
-import { randomUUID } from "crypto";
+import type { AssistantMessage, ImageContent, Message, TextContent } from "@mariozechner/pi-ai";
+import { createHash, randomUUID } from "crypto";
 import {
 	appendFileSync,
 	closeSync,
@@ -22,6 +22,7 @@ import {
 	type CustomMessage,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
+	createContextRewriteMessage,
 	createCustomMessage,
 } from "./messages.js";
 
@@ -85,6 +86,59 @@ export interface BranchSummaryEntry<T = unknown> extends SessionEntryBase {
 	fromHook?: boolean;
 }
 
+export type ContextRewriteSurface = "text" | "output" | "summary" | "rendered";
+
+export type ContextRewriteTarget =
+	| { kind: "range"; fromEntryId: string; toEntryId: string }
+	| { kind: "surface"; entryId: string; surface: ContextRewriteSurface }
+	| { kind: "insert"; afterEntryId: string | null };
+
+export interface ContextRewriteEntry<T = unknown> extends SessionEntryBase {
+	type: "context_rewrite";
+	/** Stable id used by undo entries. Defaults to this entry's id when omitted. */
+	rewriteId?: string;
+	target: ContextRewriteTarget;
+	/** Optional exact text to replace within the target surface. If omitted, replaces the whole surface. */
+	before?: string;
+	/** Optional sha256 of the target surface text before applying this rewrite. Mismatches skip the rewrite. */
+	beforeHash?: string;
+	/** Replacement text inserted into the projected context. */
+	after: string;
+	reason?: string;
+	details?: T;
+	fromHook?: boolean;
+}
+
+export interface ContextRewriteUndoEntry extends SessionEntryBase {
+	type: "context_rewrite_undo";
+	rewriteId: string;
+}
+
+export interface ContextRewriteInput<T = unknown> {
+	rewriteId?: string;
+	target: ContextRewriteTarget;
+	before?: string;
+	beforeHash?: string;
+	after: string;
+	reason?: string;
+	details?: T;
+	fromHook?: boolean;
+}
+
+export interface SessionProjectionItem {
+	message: AgentMessage;
+	/** Session entries whose projected context is represented by this item. */
+	sourceEntryIds: string[];
+	/** Entry that produced the projected item. For rewrites, this is the rewrite entry id. */
+	entryId: string;
+	rewriteId?: string;
+}
+
+export interface SessionProjection extends SessionContext {
+	items: SessionProjectionItem[];
+	activeRewrites: ContextRewriteEntry[];
+}
+
 /**
  * Custom entry for extensions to store extension-specific data in the session.
  * Use customType to identify your extension's entries.
@@ -141,6 +195,8 @@ export type SessionEntry =
 	| ModelChangeEntry
 	| CompactionEntry
 	| BranchSummaryEntry
+	| ContextRewriteEntry
+	| ContextRewriteUndoEntry
 	| CustomEntry
 	| CustomMessageEntry
 	| LabelEntry
@@ -196,6 +252,7 @@ export type ReadonlySessionManager = Pick<
 	| "getEntries"
 	| "getTree"
 	| "getSessionName"
+	| "buildSessionProjection"
 >;
 
 function createSessionId(): string {
@@ -307,17 +364,294 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 	return null;
 }
 
-/**
- * Build the session context from entries using tree traversal.
- * If leafId is provided, walks from that entry to root.
- * Handles compaction and branch summaries along the path.
- */
-export function buildSessionContext(
-	entries: SessionEntry[],
-	leafId?: string | null,
-	byId?: Map<string, SessionEntry>,
-): SessionContext {
-	// Build uuid index if not available
+export function hashContextText(text: string): string {
+	return `sha256:${createHash("sha256").update(text).digest("hex")}`;
+}
+
+function getRewriteId(entry: ContextRewriteEntry): string {
+	return entry.rewriteId ?? entry.id;
+}
+
+function getActiveContextRewrites(path: SessionEntry[]): ContextRewriteEntry[] {
+	const active = new Map<string, ContextRewriteEntry>();
+	for (const entry of path) {
+		if (entry.type === "context_rewrite") {
+			active.set(getRewriteId(entry), entry);
+		} else if (entry.type === "context_rewrite_undo") {
+			active.delete(entry.rewriteId);
+		}
+	}
+	return [...active.values()];
+}
+
+function projectEntry(entry: SessionEntry): SessionProjectionItem | undefined {
+	if (entry.type === "message") {
+		return { entryId: entry.id, sourceEntryIds: [entry.id], message: entry.message };
+	}
+	if (entry.type === "custom_message") {
+		return {
+			entryId: entry.id,
+			sourceEntryIds: [entry.id],
+			message: createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
+		};
+	}
+	if (entry.type === "branch_summary" && entry.summary) {
+		return {
+			entryId: entry.id,
+			sourceEntryIds: [entry.id],
+			message: createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp),
+		};
+	}
+	if (entry.type === "compaction") {
+		return {
+			entryId: entry.id,
+			sourceEntryIds: [entry.id],
+			message: createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp),
+		};
+	}
+	return undefined;
+}
+
+function extractTextBlocks(content: string | (TextContent | ImageContent)[]): string {
+	if (typeof content === "string") return content;
+	return content
+		.filter((block): block is TextContent => block.type === "text")
+		.map((block) => block.text)
+		.join("\n");
+}
+
+function replaceTextBlocks(
+	content: string | (TextContent | ImageContent)[],
+	text: string,
+): string | (TextContent | ImageContent)[] {
+	if (typeof content === "string") return text;
+	const images = content.filter((block): block is ImageContent => block.type === "image");
+	return [{ type: "text", text }, ...images];
+}
+
+function getMessageSurface(message: AgentMessage, surface: ContextRewriteSurface): string | undefined {
+	if (surface === "rendered") {
+		switch (message.role) {
+			case "user":
+			case "toolResult":
+			case "custom":
+				return extractTextBlocks(message.content);
+			case "assistant":
+				return message.content
+					.filter((block): block is TextContent => block.type === "text")
+					.map((block) => block.text)
+					.join("\n");
+			case "bashExecution":
+				return message.output;
+			case "branchSummary":
+			case "compactionSummary":
+				return message.summary;
+			case "contextRewrite":
+				return message.text;
+		}
+	}
+	if (surface === "output") {
+		if (message.role === "bashExecution") return message.output;
+		if (message.role === "toolResult") return extractTextBlocks(message.content);
+		return undefined;
+	}
+	if (surface === "summary") {
+		if (message.role === "branchSummary" || message.role === "compactionSummary") return message.summary;
+		return undefined;
+	}
+	if (surface === "text") {
+		if (message.role === "user" || message.role === "toolResult" || message.role === "custom") {
+			return extractTextBlocks(message.content);
+		}
+		if (message.role === "assistant") {
+			return message.content
+				.filter((block): block is TextContent => block.type === "text")
+				.map((block) => block.text)
+				.join("\n");
+		}
+		if (message.role === "contextRewrite") return message.text;
+	}
+	return undefined;
+}
+
+function applyTextRewrite(current: string, rewrite: ContextRewriteEntry): string | undefined {
+	if (rewrite.beforeHash && hashContextText(current) !== rewrite.beforeHash) {
+		return undefined;
+	}
+	if (rewrite.before === undefined) {
+		return rewrite.after;
+	}
+	const index = current.indexOf(rewrite.before);
+	if (index === -1) {
+		return undefined;
+	}
+	return `${current.slice(0, index)}${rewrite.after}${current.slice(index + rewrite.before.length)}`;
+}
+
+function rewriteAssistantText(message: AssistantMessage, text: string): AgentMessage {
+	let replaced = false;
+	const content: AssistantMessage["content"] = [];
+	for (const block of message.content) {
+		if (block.type !== "text") {
+			content.push(block);
+			continue;
+		}
+		if (!replaced) {
+			content.push({ type: "text", text });
+			replaced = true;
+		}
+	}
+	if (!replaced) {
+		content.unshift({ type: "text", text });
+	}
+	return { ...message, content };
+}
+
+function applySurfaceRewrite(
+	item: SessionProjectionItem,
+	rewrite: ContextRewriteEntry,
+): SessionProjectionItem | undefined {
+	if (rewrite.target.kind !== "surface") return undefined;
+	const surfaceText = getMessageSurface(item.message, rewrite.target.surface);
+	if (surfaceText === undefined) return undefined;
+	const replacement = applyTextRewrite(surfaceText, rewrite);
+	if (replacement === undefined) return undefined;
+
+	const rewriteId = getRewriteId(rewrite);
+	if (rewrite.target.surface === "rendered") {
+		return {
+			entryId: rewrite.id,
+			rewriteId,
+			sourceEntryIds: item.sourceEntryIds,
+			message: createContextRewriteMessage(replacement, rewriteId, rewrite.timestamp),
+		};
+	}
+
+	const message = structuredClone(item.message) as AgentMessage;
+	switch (message.role) {
+		case "user":
+		case "toolResult":
+		case "custom":
+			message.content = replaceTextBlocks(message.content, replacement);
+			break;
+		case "assistant":
+			return { ...item, message: rewriteAssistantText(message, replacement), rewriteId };
+		case "bashExecution":
+			if (rewrite.target.surface !== "output") return undefined;
+			message.output = replacement;
+			message.truncated = false;
+			message.fullOutputPath = undefined;
+			break;
+		case "branchSummary":
+		case "compactionSummary":
+			if (rewrite.target.surface !== "summary") return undefined;
+			message.summary = replacement;
+			break;
+		case "contextRewrite":
+			message.text = replacement;
+			break;
+	}
+	return { ...item, message, rewriteId };
+}
+
+function uniqueStrings(values: string[]): string[] {
+	return [...new Set(values)];
+}
+
+function itemContainsEntry(item: SessionProjectionItem, entryId: string): boolean {
+	return item.sourceEntryIds.includes(entryId) || item.entryId === entryId;
+}
+
+function getToolCallIds(message: AgentMessage): string[] {
+	if (message.role !== "assistant") return [];
+	return message.content.filter((block) => block.type === "toolCall").map((block) => block.id);
+}
+
+function getToolResultId(message: AgentMessage): string | undefined {
+	return message.role === "toolResult" ? message.toolCallId : undefined;
+}
+
+function canReplaceProjectionRange(items: SessionProjectionItem[], startIndex: number, endIndex: number): boolean {
+	const removedCallIds = new Set<string>();
+	const removedResultIds = new Set<string>();
+	const keptCallIds = new Set<string>();
+	const keptResultIds = new Set<string>();
+
+	for (let i = 0; i < items.length; i++) {
+		const inRange = i >= startIndex && i <= endIndex;
+		for (const id of getToolCallIds(items[i].message)) {
+			(inRange ? removedCallIds : keptCallIds).add(id);
+		}
+		const resultId = getToolResultId(items[i].message);
+		if (resultId) {
+			(inRange ? removedResultIds : keptResultIds).add(resultId);
+		}
+	}
+
+	for (const id of removedCallIds) {
+		if (keptResultIds.has(id)) return false;
+	}
+	for (const id of removedResultIds) {
+		if (keptCallIds.has(id)) return false;
+	}
+	return true;
+}
+
+function renderProjectionItems(items: SessionProjectionItem[]): string {
+	return items.map((item) => getMessageSurface(item.message, "rendered") ?? "").join("\n");
+}
+
+function applyContextRewrites(
+	items: SessionProjectionItem[],
+	rewrites: ContextRewriteEntry[],
+): SessionProjectionItem[] {
+	const projected = [...items];
+	for (const rewrite of rewrites) {
+		const rewriteId = getRewriteId(rewrite);
+		const target = rewrite.target;
+		if (target.kind === "insert") {
+			const afterEntryId = target.afterEntryId;
+			const afterIndex =
+				afterEntryId === null ? -1 : projected.findIndex((item) => itemContainsEntry(item, afterEntryId));
+			if (afterEntryId !== null && afterIndex === -1) continue;
+			projected.splice(afterIndex + 1, 0, {
+				entryId: rewrite.id,
+				rewriteId,
+				sourceEntryIds: [rewrite.id],
+				message: createContextRewriteMessage(rewrite.after, rewriteId, rewrite.timestamp),
+			});
+			continue;
+		}
+
+		if (target.kind === "surface") {
+			const index = projected.findIndex((item) => itemContainsEntry(item, target.entryId));
+			if (index === -1) continue;
+			if (target.surface === "rendered" && !canReplaceProjectionRange(projected, index, index)) continue;
+			const updated = applySurfaceRewrite(projected[index], rewrite);
+			if (updated) projected[index] = updated;
+			continue;
+		}
+
+		const startIndex = projected.findIndex((item) => itemContainsEntry(item, target.fromEntryId));
+		const endIndex = projected.findIndex((item) => itemContainsEntry(item, target.toEntryId));
+		if (startIndex === -1 || endIndex === -1 || startIndex > endIndex) continue;
+		if (!canReplaceProjectionRange(projected, startIndex, endIndex)) continue;
+		const rangeItems = projected.slice(startIndex, endIndex + 1);
+		const rangeText = renderProjectionItems(rangeItems);
+		const replacement = applyTextRewrite(rangeText, rewrite);
+		if (replacement === undefined) continue;
+		const sourceEntryIds = uniqueStrings(rangeItems.flatMap((item) => item.sourceEntryIds));
+		projected.splice(startIndex, endIndex - startIndex + 1, {
+			entryId: rewrite.id,
+			rewriteId,
+			sourceEntryIds,
+			message: createContextRewriteMessage(replacement, rewriteId, rewrite.timestamp),
+		});
+	}
+	return projected;
+}
+
+function buildPath(entries: SessionEntry[], leafId?: string | null, byId?: Map<string, SessionEntry>): SessionEntry[] {
 	if (!byId) {
 		byId = new Map<string, SessionEntry>();
 		for (const entry of entries) {
@@ -325,33 +659,31 @@ export function buildSessionContext(
 		}
 	}
 
-	// Find leaf
-	let leaf: SessionEntry | undefined;
 	if (leafId === null) {
-		// Explicitly null - return no messages (navigated to before first entry)
-		return { messages: [], thinkingLevel: "off", model: null };
+		return [];
 	}
+
+	let leaf: SessionEntry | undefined;
 	if (leafId) {
 		leaf = byId.get(leafId);
 	}
 	if (!leaf) {
-		// Fallback to last entry (when leafId is undefined)
 		leaf = entries[entries.length - 1];
 	}
-
 	if (!leaf) {
-		return { messages: [], thinkingLevel: "off", model: null };
+		return [];
 	}
 
-	// Walk from leaf to root, collecting path
 	const path: SessionEntry[] = [];
 	let current: SessionEntry | undefined = leaf;
 	while (current) {
 		path.unshift(current);
 		current = current.parentId ? byId.get(current.parentId) : undefined;
 	}
+	return path;
+}
 
-	// Extract settings and find compaction
+function buildProjectionFromPath(path: SessionEntry[]): SessionProjection {
 	let thinkingLevel = "off";
 	let model: { provider: string; modelId: string } | null = null;
 	let compaction: CompactionEntry | null = null;
@@ -368,56 +700,56 @@ export function buildSessionContext(
 		}
 	}
 
-	// Build messages and collect corresponding entries
-	// When there's a compaction, we need to:
-	// 1. Emit summary first (entry = compaction)
-	// 2. Emit kept messages (from firstKeptEntryId up to compaction)
-	// 3. Emit messages after compaction
-	const messages: AgentMessage[] = [];
-
-	const appendMessage = (entry: SessionEntry) => {
-		if (entry.type === "message") {
-			messages.push(entry.message);
-		} else if (entry.type === "custom_message") {
-			messages.push(
-				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
-			);
-		} else if (entry.type === "branch_summary" && entry.summary) {
-			messages.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
-		}
+	const items: SessionProjectionItem[] = [];
+	const appendItem = (entry: SessionEntry): void => {
+		const item = projectEntry(entry);
+		if (item) items.push(item);
 	};
 
 	if (compaction) {
-		// Emit summary first
-		messages.push(createCompactionSummaryMessage(compaction.summary, compaction.tokensBefore, compaction.timestamp));
-
-		// Find compaction index in path
-		const compactionIdx = path.findIndex((e) => e.type === "compaction" && e.id === compaction.id);
-
-		// Emit kept messages (before compaction, starting from firstKeptEntryId)
+		appendItem(compaction);
+		const compactionIdx = path.findIndex((entry) => entry.type === "compaction" && entry.id === compaction.id);
 		let foundFirstKept = false;
 		for (let i = 0; i < compactionIdx; i++) {
 			const entry = path[i];
-			if (entry.id === compaction.firstKeptEntryId) {
-				foundFirstKept = true;
-			}
-			if (foundFirstKept) {
-				appendMessage(entry);
-			}
+			if (entry.id === compaction.firstKeptEntryId) foundFirstKept = true;
+			if (foundFirstKept) appendItem(entry);
 		}
-
-		// Emit messages after compaction
-		for (let i = compactionIdx + 1; i < path.length; i++) {
-			const entry = path[i];
-			appendMessage(entry);
-		}
+		for (let i = compactionIdx + 1; i < path.length; i++) appendItem(path[i]);
 	} else {
-		// No compaction - emit all messages, handle branch summaries and custom messages
-		for (const entry of path) {
-			appendMessage(entry);
-		}
+		for (const entry of path) appendItem(entry);
 	}
 
+	const activeRewrites = getActiveContextRewrites(path);
+	const rewrittenItems = applyContextRewrites(items, activeRewrites);
+	return {
+		messages: rewrittenItems.map((item) => item.message),
+		thinkingLevel,
+		model,
+		items: rewrittenItems,
+		activeRewrites,
+	};
+}
+
+export function buildSessionProjection(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionProjection {
+	return buildProjectionFromPath(buildPath(entries, leafId, byId));
+}
+
+/**
+ * Build the session context from entries using tree traversal.
+ * If leafId is provided, walks from that entry to root.
+ * Handles compaction, branch summaries, and active context rewrites along the path.
+ */
+export function buildSessionContext(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionContext {
+	const { messages, thinkingLevel, model } = buildSessionProjection(entries, leafId, byId);
 	return { messages, thinkingLevel, model };
 }
 
@@ -907,6 +1239,32 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Append a context rewrite entry as child of current leaf, then advance leaf. Returns entry id. */
+	appendContextRewrite<T = unknown>(rewrite: ContextRewriteInput<T>): string {
+		const entry: ContextRewriteEntry<T> = {
+			type: "context_rewrite",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			...rewrite,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append an undo for a context rewrite. Returns entry id. */
+	appendContextRewriteUndo(rewriteId: string): string {
+		const entry: ContextRewriteUndoEntry = {
+			type: "context_rewrite_undo",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			rewriteId,
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
 	/** Append a session info entry (e.g., display name). Returns entry id. */
 	appendSessionInfo(name: string): string {
 		const entry: SessionInfoEntry = {
@@ -1043,6 +1401,14 @@ export class SessionManager {
 	}
 
 	/**
+	 * Build the session projection with source mapping and active context rewrites.
+	 * Uses tree traversal from current leaf.
+	 */
+	buildSessionProjection(): SessionProjection {
+		return buildSessionProjection(this.getEntries(), this.leafId, this.byId);
+	}
+
+	/**
 	 * Build the session context (what gets sent to the LLM).
 	 * Uses tree traversal from current leaf.
 	 */
@@ -1140,7 +1506,7 @@ export class SessionManager {
 
 	/**
 	 * Start a new branch with a summary of the abandoned path.
-	 * Same as branch(), but also appends a branch_summary entry that captures
+	 * Same as branch(), but appends a context rewrite insertion that captures
 	 * context from the abandoned conversation path.
 	 */
 	branchWithSummary(branchFromId: string | null, summary: string, details?: unknown, fromHook?: boolean): string {
@@ -1148,18 +1514,12 @@ export class SessionManager {
 			throw new Error(`Entry ${branchFromId} not found`);
 		}
 		this.leafId = branchFromId;
-		const entry: BranchSummaryEntry = {
-			type: "branch_summary",
-			id: generateId(this.byId),
-			parentId: branchFromId,
-			timestamp: new Date().toISOString(),
-			fromId: branchFromId ?? "root",
-			summary,
+		return this.appendContextRewrite({
+			target: { kind: "insert", afterEntryId: branchFromId },
+			after: summary,
 			details,
 			fromHook,
-		};
-		this._appendEntry(entry);
-		return entry.id;
+		});
 	}
 
 	/**

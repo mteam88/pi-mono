@@ -43,6 +43,7 @@ import {
 	collectEntriesForBranchSummary,
 	compact,
 	estimateContextTokens,
+	estimateTokens,
 	generateBranchSummary,
 	prepareCompaction,
 	shouldCompact,
@@ -80,7 +81,13 @@ import type { BashExecutionMessage, CustomMessage } from "./messages.js";
 import type { ModelRegistry } from "./model-registry.js";
 import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.js";
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.js";
-import type { BranchSummaryEntry, CompactionEntry, SessionManager } from "./session-manager.js";
+import type {
+	BranchSummaryEntry,
+	CompactionEntry,
+	ContextRewriteEntry,
+	ContextRewriteInput,
+	SessionManager,
+} from "./session-manager.js";
 import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader } from "./session-manager.js";
 import type { SettingsManager } from "./settings-manager.js";
 import type { SlashCommandInfo } from "./slash-commands.js";
@@ -128,6 +135,7 @@ export type AgentSessionEvent =
 	| { type: "compaction_start"; reason: "manual" | "threshold" | "overflow" }
 	| { type: "session_info_changed"; name: string | undefined }
 	| { type: "thinking_level_changed"; level: ThinkingLevel }
+	| { type: "context_changed"; reason: "context_rewrite" | "context_rewrite_undo" }
 	| {
 			type: "compaction_end";
 			reason: "manual" | "threshold" | "overflow";
@@ -281,6 +289,7 @@ export class AgentSession {
 	// Extension system
 	private _extensionRunner!: ExtensionRunner;
 	private _turnIndex = 0;
+	private _pendingContextRewriteRefresh = false;
 
 	private _resourceLoader: ResourceLoader;
 	private _customTools: ToolDefinition[];
@@ -548,6 +557,11 @@ export class AgentSession {
 			// Other message types (bashExecution, compactionSummary, branchSummary) are persisted elsewhere
 
 			// Track assistant message for auto-compaction (checked on agent_end)
+			if (this._pendingContextRewriteRefresh && event.message.role === "toolResult") {
+				this._refreshAgentMessagesFromSession();
+				this._pendingContextRewriteRefresh = false;
+			}
+
 			if (event.message.role === "assistant") {
 				this._lastAssistantMessage = event.message;
 
@@ -567,6 +581,11 @@ export class AgentSession {
 					this._retryAttempt = 0;
 				}
 			}
+		}
+
+		if (event.type === "agent_end" && this._pendingContextRewriteRefresh) {
+			this._refreshAgentMessagesFromSession();
+			this._pendingContextRewriteRefresh = false;
 		}
 
 		// Check auto-retry and auto-compaction after agent completes
@@ -913,6 +932,15 @@ export class AgentSession {
 			}
 		}
 		return Array.from(unique);
+	}
+
+	private _refreshAgentMessagesFromSession(): void {
+		const sessionContext = this.sessionManager.buildSessionContext();
+		this.agent.state.messages = sessionContext.messages;
+	}
+
+	private _emitContextChanged(reason: "context_rewrite" | "context_rewrite_undo"): void {
+		this._emit({ type: "context_changed", reason });
 	}
 
 	private _rebuildSystemPrompt(toolNames: string[]): string {
@@ -2177,6 +2205,26 @@ export class AgentSession {
 				appendEntry: (customType, data) => {
 					this.sessionManager.appendCustomEntry(customType, data);
 				},
+				appendContextRewrite: <T = unknown>(rewrite: ContextRewriteInput<T>) => {
+					const id = this.sessionManager.appendContextRewrite({ ...rewrite, fromHook: rewrite.fromHook ?? true });
+					if (this.isStreaming) {
+						this._pendingContextRewriteRefresh = true;
+					} else {
+						this._refreshAgentMessagesFromSession();
+					}
+					this._emitContextChanged("context_rewrite");
+					return id;
+				},
+				undoContextRewrite: (rewriteId) => {
+					const id = this.sessionManager.appendContextRewriteUndo(rewriteId);
+					if (this.isStreaming) {
+						this._pendingContextRewriteRefresh = true;
+					} else {
+						this._refreshAgentMessagesFromSession();
+					}
+					this._emitContextChanged("context_rewrite_undo");
+					return id;
+				},
 				setSessionName: (name) => {
 					this.setSessionName(name);
 				},
@@ -2681,7 +2729,12 @@ export class AgentSession {
 	async navigateTree(
 		targetId: string,
 		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
-	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+	): Promise<{
+		editorText?: string;
+		cancelled: boolean;
+		aborted?: boolean;
+		summaryEntry?: BranchSummaryEntry | ContextRewriteEntry;
+	}> {
 		const oldLeafId = this.sessionManager.getLeafId();
 
 		// No-op if already at target
@@ -2815,7 +2868,7 @@ export class AgentSession {
 
 			// Switch leaf (with or without summary)
 			// Summary is attached at the navigation target position (newLeafId), not the old branch
-			let summaryEntry: BranchSummaryEntry | undefined;
+			let summaryEntry: BranchSummaryEntry | ContextRewriteEntry | undefined;
 			if (summaryText) {
 				// Create summary at target position (can be null for root)
 				const summaryId = this.sessionManager.branchWithSummary(
@@ -2824,7 +2877,8 @@ export class AgentSession {
 					summaryDetails,
 					fromExtension,
 				);
-				summaryEntry = this.sessionManager.getEntry(summaryId) as BranchSummaryEntry;
+				const entry = this.sessionManager.getEntry(summaryId);
+				summaryEntry = entry?.type === "branch_summary" || entry?.type === "context_rewrite" ? entry : undefined;
 
 				// Attach label to the summary entry
 				if (label) {
@@ -2844,8 +2898,7 @@ export class AgentSession {
 			}
 
 			// Update agent state
-			const sessionContext = this.sessionManager.buildSessionContext();
-			this.agent.state.messages = sessionContext.messages;
+			this._refreshAgentMessagesFromSession();
 
 			// Emit session_tree event
 			await this._extensionRunner.emit({
@@ -2949,6 +3002,16 @@ export class AgentSession {
 
 		const contextWindow = model.contextWindow ?? 0;
 		if (contextWindow <= 0) return undefined;
+
+		const projection = this.sessionManager.buildSessionProjection();
+		if (projection.activeRewrites.length > 0) {
+			const tokens = projection.messages.reduce((total, message) => total + estimateTokens(message), 0);
+			return {
+				tokens,
+				contextWindow,
+				percent: (tokens / contextWindow) * 100,
+			};
+		}
 
 		// After compaction, the last assistant usage reflects pre-compaction context size.
 		// We can only trust usage from an assistant that responded after the latest compaction.

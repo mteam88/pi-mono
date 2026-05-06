@@ -2675,6 +2675,11 @@ export class InteractiveMode {
 				this.updateEditorBorderColor();
 				break;
 
+			case "context_changed":
+				this.footer.invalidate();
+				this.ui.requestRender();
+				break;
+
 			case "message_start":
 				if (event.message.role === "custom") {
 					this.addMessageToChat(event.message);
@@ -3082,6 +3087,11 @@ export class InteractiveMode {
 			}
 			case "toolResult": {
 				// Tool results are rendered inline with tool calls, handled separately
+				break;
+			}
+			case "contextRewrite": {
+				const userComponent = new UserMessageComponent(message.text, this.getMarkdownThemeWithSettings());
+				this.chatContainer.addChild(userComponent);
 				break;
 			}
 			default: {

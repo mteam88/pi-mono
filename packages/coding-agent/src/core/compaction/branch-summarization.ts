@@ -12,6 +12,7 @@ import {
 	convertToLlm,
 	createBranchSummaryMessage,
 	createCompactionSummaryMessage,
+	createContextRewriteMessage,
 	createCustomMessage,
 } from "../messages.js";
 import type { ReadonlySessionManager, SessionEntry } from "../session-manager.js";
@@ -159,9 +160,13 @@ function getMessageFromEntry(entry: SessionEntry): AgentMessage | undefined {
 		case "compaction":
 			return createCompactionSummaryMessage(entry.summary, entry.tokensBefore, entry.timestamp);
 
+		case "context_rewrite":
+			return createContextRewriteMessage(entry.after, entry.rewriteId ?? entry.id, entry.timestamp);
+
 		// These don't contribute to conversation content
 		case "thinking_level_change":
 		case "model_change":
+		case "context_rewrite_undo":
 		case "custom":
 		case "label":
 		case "session_info":
@@ -191,8 +196,13 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 	// This ensures we capture cumulative file tracking from nested branch summaries
 	// Only extract from pi-generated summaries (fromHook !== true), not extension-generated ones
 	for (const entry of entries) {
-		if (entry.type === "branch_summary" && !entry.fromHook && entry.details) {
-			const details = entry.details as BranchSummaryDetails;
+		const details =
+			entry.type === "branch_summary" && !entry.fromHook && entry.details
+				? (entry.details as BranchSummaryDetails)
+				: entry.type === "context_rewrite" && !entry.fromHook && entry.details
+					? (entry.details as BranchSummaryDetails)
+					: undefined;
+		if (details) {
 			if (Array.isArray(details.readFiles)) {
 				for (const f of details.readFiles) fileOps.read.add(f);
 			}
@@ -219,7 +229,7 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		// Check budget before adding
 		if (tokenBudget > 0 && totalTokens + tokens > tokenBudget) {
 			// If this is a summary entry, try to fit it anyway as it's important context
-			if (entry.type === "compaction" || entry.type === "branch_summary") {
+			if (entry.type === "compaction" || entry.type === "branch_summary" || entry.type === "context_rewrite") {
 				if (totalTokens < tokenBudget * 0.9) {
 					messages.unshift(message);
 					totalTokens += tokens;

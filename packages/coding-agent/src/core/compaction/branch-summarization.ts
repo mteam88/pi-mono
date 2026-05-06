@@ -147,6 +147,24 @@ export function collectEntriesForBranchSummary(
  * @param entries - Entries in chronological order
  * @param tokenBudget - Maximum tokens to include (0 = no limit)
  */
+function normalizeRewriteAnchorsForCollectedBranch(entries: SessionEntry[]): SessionEntry[] {
+	const entryIds = new Set(entries.map((entry) => entry.id));
+	return entries.map((entry) => {
+		if (
+			entry.type !== "context_rewrite" ||
+			entry.target.kind !== "insert" ||
+			entry.target.afterEntryId === null ||
+			entryIds.has(entry.target.afterEntryId)
+		) {
+			return entry;
+		}
+		// Branch-summary collection intentionally excludes the common ancestor.
+		// If an insertion targets that ancestor, keep the inserted context at the
+		// start of the collected branch rather than dropping it as unanchored.
+		return { ...entry, target: { ...entry.target, afterEntryId: null } };
+	});
+}
+
 export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: number = 0): BranchPreparation {
 	const messages: AgentMessage[] = [];
 	const fileOps = createFileOps();
@@ -175,7 +193,9 @@ export function prepareBranchEntries(entries: SessionEntry[], tokenBudget: numbe
 		}
 	}
 
-	const projectedItems = buildSessionProjection(entries).items.filter((item) => item.message.role !== "toolResult");
+	const projectedItems = buildSessionProjection(normalizeRewriteAnchorsForCollectedBranch(entries)).items.filter(
+		(item) => item.message.role !== "toolResult",
+	);
 
 	// Second pass: walk from newest to oldest, adding projected messages until token budget
 	for (let i = projectedItems.length - 1; i >= 0; i--) {

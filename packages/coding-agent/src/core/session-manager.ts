@@ -1243,11 +1243,11 @@ export class SessionManager {
 	/** Append a context rewrite entry as child of current leaf, then advance leaf. Returns entry id. */
 	appendContextRewrite<T = unknown>(rewrite: ContextRewriteInput<T>): string {
 		const entry: ContextRewriteEntry<T> = {
+			...rewrite,
 			type: "context_rewrite",
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
-			...rewrite,
 		};
 		this._appendEntry(entry);
 		return entry.id;

@@ -112,7 +112,7 @@ Valid cut points are:
 - User messages
 - Assistant messages
 - BashExecution messages
-- Custom/projection messages (`custom_message`, legacy `branch_summary`, `context_rewrite`)
+- Custom/projection messages (`custom_message`, legacy `branch_summary`, projected context rewrite insertions)
 
 Never cut at tool results (they must stay with their tool call).
 

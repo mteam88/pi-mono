@@ -15,10 +15,10 @@ import {
 	createCustomMessage,
 } from "../messages.js";
 import {
-	buildSessionContext,
 	buildSessionProjection,
 	type CompactionEntry,
 	type SessionEntry,
+	type SessionProjectionItem,
 } from "../session-manager.js";
 import {
 	computeFileLists,
@@ -367,6 +367,24 @@ function estimateEntryTokensForCut(entry: SessionEntry): number {
 	}
 }
 
+function includePrecedingMetadata(entries: SessionEntry[], cutIndex: number, startIndex: number): number {
+	let index = cutIndex;
+	while (index > startIndex) {
+		const prevEntry = entries[index - 1];
+		// Stop at session header or compaction boundaries
+		if (prevEntry.type === "compaction") {
+			break;
+		}
+		if (prevEntry.type === "message") {
+			// Stop if we hit any message
+			break;
+		}
+		// Include this non-message entry (settings changes, labels, etc.)
+		index--;
+	}
+	return index;
+}
+
 export interface CutPointResult {
 	/** Index of first entry to keep */
 	firstKeptEntryIndex: number;
@@ -428,20 +446,7 @@ export function findCutPoint(
 		}
 	}
 
-	// Scan backwards from cutIndex to include any non-message entries (bash, settings, etc.)
-	while (cutIndex > startIndex) {
-		const prevEntry = entries[cutIndex - 1];
-		// Stop at session header or compaction boundaries
-		if (prevEntry.type === "compaction") {
-			break;
-		}
-		if (prevEntry.type === "message") {
-			// Stop if we hit any message
-			break;
-		}
-		// Include this non-message entry (bash, settings change, etc.)
-		cutIndex--;
-	}
+	cutIndex = includePrecedingMetadata(entries, cutIndex, startIndex);
 
 	// Determine if this is a split turn
 	const cutEntry = entries[cutIndex];
@@ -452,6 +457,100 @@ export function findCutPoint(
 		firstKeptEntryIndex: cutIndex,
 		turnStartIndex,
 		isSplitTurn: !isUserMessage && turnStartIndex !== -1,
+	};
+}
+
+function isProjectedTurnStart(message: AgentMessage): boolean {
+	return (
+		message.role === "user" ||
+		message.role === "bashExecution" ||
+		message.role === "custom" ||
+		message.role === "branchSummary" ||
+		message.role === "compactionSummary" ||
+		message.role === "contextRewrite"
+	);
+}
+
+function isProjectedCutPoint(message: AgentMessage): boolean {
+	return isProjectedTurnStart(message) || message.role === "assistant";
+}
+
+function sourceIndexInRange(
+	item: SessionProjectionItem,
+	entryIndexById: Map<string, number>,
+	startIndex: number,
+	endIndex: number,
+): number | undefined {
+	let result: number | undefined;
+	for (const entryId of item.sourceEntryIds) {
+		const index = entryIndexById.get(entryId);
+		if (index === undefined || index < startIndex || index >= endIndex) continue;
+		result = result === undefined ? index : Math.min(result, index);
+	}
+	return result;
+}
+
+function findProjectedTurnStartIndex(
+	projectedItems: SessionProjectionItem[],
+	itemIndex: number,
+	entryIndexById: Map<string, number>,
+	startIndex: number,
+	endIndex: number,
+): number {
+	for (let i = itemIndex; i >= 0; i--) {
+		const item = projectedItems[i];
+		if (!isProjectedTurnStart(item.message)) continue;
+		const index = sourceIndexInRange(item, entryIndexById, startIndex, endIndex);
+		if (index !== undefined) return index;
+	}
+	return -1;
+}
+
+function findProjectedCutPoint(
+	entries: SessionEntry[],
+	projectedItems: SessionProjectionItem[],
+	startIndex: number,
+	endIndex: number,
+	keepRecentTokens: number,
+): CutPointResult {
+	const entryIndexById = new Map(entries.map((entry, index) => [entry.id, index]));
+	const projectedWithIndex = projectedItems
+		.map((item, index) => ({
+			item,
+			index,
+			entryIndex: sourceIndexInRange(item, entryIndexById, startIndex, endIndex),
+		}))
+		.filter(
+			(item): item is { item: SessionProjectionItem; index: number; entryIndex: number } =>
+				item.entryIndex !== undefined,
+		);
+	const cutPoints = projectedWithIndex.filter(({ item }) => isProjectedCutPoint(item.message));
+
+	if (cutPoints.length === 0) {
+		return { firstKeptEntryIndex: startIndex, turnStartIndex: -1, isSplitTurn: false };
+	}
+
+	let accumulatedTokens = 0;
+	let cutPoint = cutPoints[0];
+	for (let i = projectedWithIndex.length - 1; i >= 0; i--) {
+		const current = projectedWithIndex[i];
+		accumulatedTokens += estimateTokens(current.item.message);
+		if (accumulatedTokens < keepRecentTokens) continue;
+
+		const nextCutPoint = cutPoints.find((candidate) => candidate.index >= current.index);
+		if (nextCutPoint) cutPoint = nextCutPoint;
+		break;
+	}
+
+	const cutIndex = includePrecedingMetadata(entries, cutPoint.entryIndex, startIndex);
+	const turnStartIndex = isProjectedTurnStart(cutPoint.item.message)
+		? -1
+		: findProjectedTurnStartIndex(projectedItems, cutPoint.index, entryIndexById, startIndex, endIndex);
+
+	return {
+		firstKeptEntryIndex: cutIndex,
+		turnStartIndex,
+		isSplitTurn: turnStartIndex !== -1,
 	};
 }
 
@@ -645,9 +744,13 @@ export function prepareCompaction(
 	}
 	const boundaryEnd = pathEntries.length;
 
-	const tokensBefore = estimateContextTokens(buildSessionContext(pathEntries).messages).tokens;
+	const projection = buildSessionProjection(pathEntries);
+	const tokensBefore = estimateContextTokens(projection.messages).tokens;
 
-	const cutPoint = findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
+	const cutPoint =
+		projection.activeRewrites.length > 0
+			? findProjectedCutPoint(pathEntries, projection.items, boundaryStart, boundaryEnd, settings.keepRecentTokens)
+			: findCutPoint(pathEntries, boundaryStart, boundaryEnd, settings.keepRecentTokens);
 
 	// Get UUID of first kept entry
 	const firstKeptEntry = pathEntries[cutPoint.firstKeptEntryIndex];
@@ -658,10 +761,9 @@ export function prepareCompaction(
 
 	const historyEnd = cutPoint.isSplitTurn ? cutPoint.turnStartIndex : cutPoint.firstKeptEntryIndex;
 
-	const effectiveItems = buildSessionProjection(pathEntries).items;
 	const collectEffectiveMessages = (start: number, end: number): AgentMessage[] => {
 		const ids = new Set(pathEntries.slice(start, end).map((entry) => entry.id));
-		return effectiveItems
+		return projection.items
 			.filter((item) => item.sourceEntryIds.some((id) => ids.has(id)))
 			.map((item) => item.message)
 			.filter((message) => message.role !== "compactionSummary");

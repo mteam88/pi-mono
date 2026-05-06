@@ -18,6 +18,7 @@ import {
 import {
 	buildSessionContext,
 	type CompactionEntry,
+	hashContextText,
 	type ModelChangeEntry,
 	migrateSessionEntries,
 	parseSessionEntries,
@@ -482,12 +483,35 @@ describe("Large session fixture", () => {
 		expect(role === "user" || role === "assistant").toBe(true);
 	});
 
-	it("should load session correctly", () => {
-		const entries = loadLargeSessionEntries();
-		const loaded = buildSessionContext(entries);
+	it("uses projected rewrite size when choosing a compaction cut point", () => {
+		const u1 = createMessageEntry(createUserMessage("run command"));
+		const output = "large output ".repeat(1000);
+		const b1 = createMessageEntry({
+			role: "bashExecution",
+			command: "generate large output",
+			output,
+			exitCode: 0,
+			cancelled: false,
+			truncated: false,
+			timestamp: Date.now(),
+		});
+		const rewrite = {
+			type: "context_rewrite" as const,
+			id: `test-id-${entryCounter++}`,
+			parentId: lastId,
+			timestamp: new Date().toISOString(),
+			target: { kind: "surface" as const, entryId: b1.id, surface: "output" as const },
+			beforeHash: hashContextText(output),
+			after: "[output omitted]",
+		};
+		lastId = rewrite.id;
+		const u2 = createMessageEntry(createUserMessage("current work"));
+		const preparation = prepareCompaction([u1, b1, rewrite, u2], {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 100,
+		});
 
-		expect(loaded.messages.length).toBeGreaterThan(100);
-		expect(loaded.model).not.toBeNull();
+		expect(preparation?.firstKeptEntryId).toBe(u1.id);
 	});
 });
 
